@@ -1,0 +1,337 @@
+---
+title: "Reproduce_NSHPC_SparseSeq"
+author: "Shuyu Guo"
+date: "12/7/2024"
+output: html_document
+---
+
+```{r}
+library(pracma)
+library(stats)
+```
+
+
+```{r}
+# this function is for computing the coefficient of z^p
+# phi_list: vector of phi (theta_i = 0)
+# psi_list: vector of psi(convolution) (theta_i != 0)
+
+get_coeff_dp = function(phi_list, psi_list, p) {
+  n = length(phi_list)
+  
+  # Initialize a DP table where dp[k] is the coefficient of z^k
+  dp = rep(0,(p+1))
+  dp[1] = 1  # Coefficient of z^0 is 1 (index 1 in R corresponds to 0 power) 0, 1, ..., p
+  
+  # Iterate over all terms in the product
+  for (i in 1:n) {
+    # Traverse in reverse order to avoid overwriting values during updates
+    for (j in (p+1):1) {
+      # selecting an phi_i term (from p to p)
+      dp[j] = dp[j] * phi_list[i]
+      # selecting a psi_i term (from p-1 to p)
+      if (j > 1) {
+        dp[j] = dp[j] + dp[j - 1] * psi_list[i]
+      }
+    }
+  }
+  
+  # Return the coefficient of z^p (index p+1 in R corresponds to z^p)
+  return(dp[p + 1])
+}
+
+```
+
+
+
+```{r}
+
+# compute the coefficient of z^p when theta_i is not included in S.
+# d: length (n+1) vector, each element is the summation over |S| = p (p = 0,..., n)
+# phi_i: phi(x_i) (theta_i = 0)
+# psi_i: psi(x_i) (theta_i != 0)
+
+# Return: length n vector, each element is the summation over |S| = p (p = 0,..., n-1) where i-th theta is not included. (phi(x_i) is multiplied at last)
+get_coeff_wo_i_alt = function(d, i, phi_list, psi_list){
+  n = length(d) - 1 
+  d_wo_i = rep(0,n)
+  for (p in 0:(n-1)) {
+    d_wo_i[p+1] = get_coeff_dp(phi_list[-i], psi_list[-i], p)
+  }
+  d_wo_i = phi_list[i] * d_wo_i
+  return(d_wo_i)
+}
+
+```
+
+
+```{r}
+# compute normalizing constant
+# d: length (n+1) vector, each element is the summation over |S| = p (p = 0,..., n)
+# prior_p: a length (n+1) vector (prior prob of nonzero dimension, p = 0, ..., n)
+# prior_S: a length (n+1) vector of 1/(n,p), p = 0, ..., n
+get_Qn = function(phi_list, psi_list, d, prior_p, prior_S){
+  n = length(phi_list)
+  Qn = sum(prior_p * prior_S * d)
+  return(Qn)
+}
+```
+
+
+
+```{r}
+# compute marginal posterior probability of {theta_i = 0}
+
+# i: indicator of theta
+get_postprob_zero = function(i,phi_list, psi_list, d, prior_p, prior_S, Qn){
+  n = length(phi_list)
+  # Qn = get_Qn(phi_list, psi_list, d, prior_p, prior_S)
+  # phi_i = phi_list[i]
+  # psi_i = psi_list[i]
+  di_ = get_coeff_wo_i_alt(d, i, phi_list, psi_list)
+  numerator = sum(prior_p[-(n+1)] * prior_S[-(n+1)] * di_)
+  postprob_zero = numerator / Qn
+  return(postprob_zero)
+}
+```
+
+
+```{r}
+# compute posterior mean
+# to use this, first get_postprob_zero
+
+# X: length n vector of data 
+# g: individual prior for theta_i (need to define a function in R)
+# postprob_zero: length n vector P(theta_i=0|X)
+get_post_mean = function(X, i, postprob_zero_i, psi_list, g){
+  p_m = (1-postprob_zero_i) / psi_list[i] * integrate(function(z) z*dnorm(X[i]-z)*g(z),lower = -Inf, upper = Inf)$value
+  return(p_m)
+}
+```
+
+
+```{r}
+# compute posterior median
+
+get_cdf = function(X, i, postprob_zero_i, psi_list, g, int_upper){
+  cdf = (1-postprob_zero_i) / psi_list[i] * integrate(function(z) g(z)*dnorm(X[i]-z), lower = -Inf, upper = int_upper)$value
+  return(cdf)
+}
+
+uniroot_func1 = function(X, i, postprob_zero_i, psi_list, g, int_upper){
+  f = get_cdf(X, i, postprob_zero_i, psi_list, g, int_upper)
+  return(f-0.5)
+}
+
+uniroot_func2 = function(X, i, postprob_zero_i, psi_list, g, int_lower){
+  f = (1-postprob_zero_i) / psi_list[i] * integrate(function(z) g(z)*dnorm(X[i]-z), lower = int_lower, upper = Inf)$value
+  return(f-0.5)
+}
+
+get_post_median = function(X, i, postprob_zero_i, psi_list, g){
+  cdf_0 = get_cdf(X, i, postprob_zero_i, psi_list, g, int_upper = 0)
+  # cat("No.", i, "cdf_0: ", cdf_0,"cdf_0+p0", cdf_0+postprob_zero_i, "\n", sep = " ")
+  if(cdf_0<0.5){
+    if(cdf_0 + postprob_zero_i >=0.5){
+      p_md = 0
+      # print("p_md = 0")
+    }else{
+      #print(postprob_zero_i-0.5)
+      #cat("endpt1", get_cdf(X, i, postprob_zero_i, psi_list, g, -100)+postprob_zero_i-0.5, "\n")
+      #cat("endpt0", get_cdf(X, i, postprob_zero_i, psi_list, g, 0)+postprob_zero_i-0.5, "\n")
+      #cat("endpt5", get_cdf(X, i, postprob_zero_i, psi_list, g, 5)+postprob_zero_i-0.5, "\n")
+      #cat("endpt2", get_cdf(X, i, postprob_zero_i, psi_list, g, 100)+postprob_zero_i-0.5, "\n")
+      p_md = uniroot(uniroot_func2, interval = c(0, 10), X = X, i=i, postprob_zero_i = postprob_zero_i, psi_list = psi_list, g = g)$root
+      # cat("p_md = ", p_md,"\n")
+      # now p_md > 0
+    }
+  }else{
+    p_md = uniroot(uniroot_func1, interval = c(-10, 0), X = X, i=i, postprob_zero_i = postprob_zero_i, psi_list = psi_list, g = g)$root
+    # cat("p_md = ", p_md,"\n")
+    # now p_md < 0
+  }
+  return(p_md)
+}
+
+```
+
+
+
+```{r}
+# main function
+find_needles = function(X, g, prior_p_func){
+  n = length(X)
+  
+  # get phi_list and psi_list
+  # get prior_S and prior_p
+  phi_list = dnorm(X)
+  psi_list = rep(0,n)
+  prior_S = rep(0,(n+1))
+  prior_p = rep(0,(n+1))
+  for (i in 1:n) {
+    psi_list[i] = integrate(function(z) dnorm(X[i]-z)*g(z), lower = -Inf, upper = Inf)$value
+    prior_p[i] = prior_p_func(i-1)
+    prior_S[i] = 1 / nchoosek(n,(i-1))
+  }
+  prior_p[n+1] = prior_p_func(n)
+  prior_S[n+1] = 1
+  
+  # get coefficient for z^p (summation over |S|=p, p=1,...,n)
+  d = rep(0,(n+1))
+  for (p in 0:n) {
+    d[p+1] = get_coeff_dp(phi_list, psi_list, p)
+    # cat("p=", p,"\n")
+  }
+  
+  # get normalizing constant
+  Qn = get_Qn(phi_list, psi_list, d, prior_p, prior_S)
+  
+  # get post_mean or post_median
+  postprob_zero_list = rep(0,n)
+  post_mean_list = rep(0,n)
+  post_median_list = rep(0,n)
+  for (i in 1:n) {
+    postprob_zero_i = get_postprob_zero(i,phi_list, psi_list, d, prior_p, prior_S, Qn)
+    postprob_zero_list[i] = postprob_zero_i
+    post_mean_list[i] = get_post_mean(X, i, postprob_zero_i, psi_list, g)
+    post_median_list[i] = get_post_median(X, i, postprob_zero_i, psi_list, g)
+    if(i%%10 ==0 ){
+      cat("coordinate: ", i ,"\n")
+    }
+  }
+  return(list(postprob_zero_list, post_mean_list, post_median_list))
+    
+}
+
+```
+
+
+
+```{r}
+# an example output from the main function find_needles()
+# true nonzero dim = 5; signal = 5; Laplacian prior for nonzero coef; 
+# prior for nonzero dimension: nchoosek(2n-p, n)^0.1
+
+n = 100
+p_n = 5
+signal = 5
+theta_ = c(rep(signal,p_n), rep(0,n-p_n))
+X_ = theta_ + rnorm(n)
+g_function = function(x) 0.5 * exp(-abs(x))
+prior_p_function = function(p) (nchoosek(2*n-p, n))^0.1
+
+estimate = find_needles(X = X_, g = g_function, prior_p_func = prior_p_function)
+
+estimate[[1]]
+estimate[[2]]
+estimate[[3]]
+```
+
+
+
+
+
+
+
+```{r}
+# run N replications and average the performance
+
+# perform[1]: MSE
+# if estimator is posterior median:
+# perform[2]: dimension of nonzeros in estimator
+# perform[3]: number of True Positive
+# perform[4]: number of False Positive
+evaluate_estimator = function(hat_theta_mat, true_theta, Md = TRUE){
+  perform = rep(0,4)
+  perform[1] = mean(colSums((hat_theta_mat - true_theta)^2))
+  if(Md==TRUE){
+    perform[2] = mean(colSums(hat_theta_mat != 0))
+    perform[3] = mean(colSums((hat_theta_mat != 0) & (true_theta!= 0)))
+    perform[4] = mean(colSums((hat_theta_mat != 0) & (true_theta== 0)))
+  }
+  return(perform)
+}
+
+# evaluate the performance 
+Posterior_performance = function(iter_num, n, p_n, signal){
+  PM_collection_Lap = matrix(rep(0,iter_num*n),ncol = iter_num)
+  PMd_collection_Lap = matrix(rep(0,iter_num*n),ncol = iter_num)
+  
+  PM_collection_Gaus = matrix(rep(0,iter_num*n),ncol = iter_num)
+  PMd_collection_Gaus = matrix(rep(0,iter_num*n),ncol = iter_num)
+  
+  M_EB_collection = matrix(rep(0,iter_num*n), ncol = iter_num)
+  Md_EB_collection = matrix(rep(0,iter_num*n), ncol = iter_num)
+  
+  true_theta = c(rep(signal,p_n), rep(0,n-p_n))*rep(c(1, -1), length.out = n)
+  
+  for (iter in 1:iter_num) {
+    cat("iter: ", iter, "\n")
+    X_ = true_theta + rnorm(n)
+    estimate_Lap = find_needles(X = X_, g = function(x) 0.5 * exp(-abs(x)), prior_p_func = function(p) (nchoosek(2*n-p, n)))
+    estimate_Gaus = find_needles(X = X_, g = function(x) dnorm(x), prior_p_func = function(p) (nchoosek(2*n-p, n)))
+    
+    PM_collection_Lap[,iter] = estimate_Lap[[2]]
+    PMd_collection_Lap[,iter] = estimate_Lap[[3]]
+    PM_collection_Gaus[,iter] = estimate_Gaus[[2]]
+    PMd_collection_Gaus[,iter] = estimate_Gaus[[3]]
+    M_EB_collection[,iter] = ebayesthresh(X_, prior = "laplace", threshrule = "mean")
+    Md_EB_collection[,iter] = ebayesthresh(X_, prior = "laplace")
+  }
+  # performance of estimators
+  PM_Lap_perform = evaluate_estimator(PM_collection_Lap, true_theta, Md = FALSE)
+  PMd_Lap_perform = evaluate_estimator(PMd_collection_Lap, true_theta, Md = TRUE)
+  
+  PM_Gaus_perform = evaluate_estimator(PM_collection_Gaus, true_theta, Md = FALSE)
+  PMd_Gaus_perform = evaluate_estimator(PMd_collection_Gaus, true_theta, Md = TRUE)
+  
+  M_EB_perform = evaluate_estimator(M_EB_collection, true_theta, Md = FALSE)
+  Md_EB_perform = evaluate_estimator(Md_EB_collection, true_theta, Md = TRUE)
+  
+  return(cbind(PM_Lap_perform,PMd_Lap_perform, PM_Gaus_perform, PMd_Gaus_perform, M_EB_perform, Md_EB_perform))
+
+}
+
+```
+
+
+```{r}
+# true nonzero dim = 5
+# nonzero coefficients = 3
+table1 = Posterior_performance(iter_num = 100, n=100, p_n=5, signal=3)
+# write.csv(table1,"table1.csv")
+
+# nonzero coefficients = 5
+table2 = Posterior_performance(iter_num = 100, n=100, p_n=5, signal=5)
+# write.csv(table2,"table2.csv")
+```
+
+
+
+```{r}
+# true nonzero dim = 10
+# nonzero coefficients = 3
+table3 = Posterior_performance(iter_num = 100, n=100, p_n=10, signal=3)
+# write.csv(table3,"table3.csv")
+
+# nonzero coefficients = 5
+table4 = Posterior_performance(iter_num = 100, n=100, p_n=10, signal=5)
+# write.csv(table4,"table4.csv")
+```
+
+
+
+```{r}
+# true nonzero dim = 20
+# nonzero coefficients = 3
+table5 = Posterior_performance(iter_num = 100, n=100, p_n=20, signal=3)
+# write.csv(table5,"table5.csv")
+
+# nonzero coefficients = 5
+table6 = Posterior_performance(iter_num = 100, n=100, p_n=20, signal=5)
+# write.csv(table6,"table6.csv")
+```
+
+
+
+
